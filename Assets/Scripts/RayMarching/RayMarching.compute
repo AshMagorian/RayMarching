@@ -1,0 +1,225 @@
+﻿#pragma kernel CSMain
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+
+float4x4 cameraToWorld;
+float4x4 cameraInverseProjection;
+
+float3 lightDirection;
+
+static const float maxDst = 100;
+static const float epsilon = 0.001f;
+
+struct Shape {
+
+    float3 position;
+    float3 size;
+    float3 colour;
+    int shapeType;
+    int operation;
+    float blendStrength;
+};
+
+StructuredBuffer<Shape> shapes;
+int numShapes;
+
+struct Ray 
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateCameraRay(float2 uv, float3 origin);
+Ray CreateRay(float3 origin, float3 direction);
+
+float4 GetSceneData(float3 eye);
+float GetShapeDisance(Shape shape, float3 eye);
+float Sphere_SDF(float3 eye, float3 centre, float radius);
+float Cube_SDF(float3 eye, float3 centre, float3 size);
+float Torus_SDF(float3 eye, float3 centre, float r1, float r2);
+
+float4 Combine(float dstA, float dstB, float3 colourA, float3 colourB, int operation, float blendStrength);
+float4 Blend(float a, float b, float3 colA, float3 colB, float k);
+float3 CalcNormal(float3 p);
+float CalculateLighting(float3 viewDir, float3 p, float3 normal);
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    //Gets the texture size imformation
+    Destination.GetDimensions(width, height);
+    Destination[id.xy] = Source[id.xy];
+
+    // Gets the width and height in the range of -1 to 1
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+    float rayDst = 0;
+
+    //Create initial ray from the camera origin
+    float3 camOrigin = mul(cameraToWorld, float4(0, 0, 0, 1)).xyz;
+    Ray ray = CreateCameraRay(uv, camOrigin);
+    int marchSteps = 0;
+
+    while (rayDst < maxDst)
+    {
+        marchSteps++;
+        float4 nextStepData = GetSceneData(ray.origin); // (R,G,B,Distance)
+        float dst = nextStepData.w;
+        if (dst <= epsilon) // ray has hit a surface
+        {
+            float3 pointOnSurface = ray.origin + ray.direction * dst;
+
+            // Calculate lighting
+            float3 normal = CalcNormal(pointOnSurface - ray.direction * epsilon);
+            float lighting = CalculateLighting(ray.direction, pointOnSurface, normal);
+            float3 col = nextStepData.xyz;
+
+            Destination[id.xy] = float4(col * lighting, 1);
+            break;
+        }
+        //Move the origin to the next point
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+    // If the ray has reached max distance then use the background colour
+   if (rayDst >= maxDst)
+       Destination[id.xy] = float4(0.2,0.2,0.25, 1);
+}
+
+float3 CalcNormal(float3 p) {
+    float x = GetSceneData(float3(p.x + epsilon, p.y, p.z)).w - GetSceneData(float3(p.x - epsilon, p.y, p.z)).w;
+    float y = GetSceneData(float3(p.x, p.y + epsilon, p.z)).w - GetSceneData(float3(p.x, p.y - epsilon, p.z)).w;
+    float z = GetSceneData(float3(p.x, p.y, p.z + epsilon)).w - GetSceneData(float3(p.x, p.y, p.z - epsilon)).w;
+    return normalize(float3(x, y, z));
+}
+
+float CalculateLighting(float3 viewDir, float3 p, float3 normal)
+{
+    float ambient = 0.2f;
+    float diffuse = saturate(dot(normal, -lightDirection));
+
+    // Phong lighting model
+    //float3 reflectDir = reflect(-lightDirection, normal);
+    //float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
+
+    // Blinn-Phong lighting model
+    float3 halfwayDir = normalize(-lightDirection - viewDir);
+    Float spec = pow(max(dot(normal, halfwayDir), 0.0), 64.0);
+
+    return saturate(ambient + diffuse)+ spec;
+}
+
+Ray CreateCameraRay(float2 uv, float3 origin)
+{
+    float3 direction = mul(cameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(cameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+Ray CreateRay(float3 origin, float3 direction) 
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+float4 GetSceneData(float3 eye)
+{
+    float globalDst = maxDst;
+    float3 globalColour = 1;
+
+    for (int i = 0; i < numShapes; i++)
+    {
+        Shape shape = shapes[i];
+        float localDst = GetShapeDisance(shape, eye);
+        float3 localColour = shape.colour;
+
+        float4 globalCombined = Combine(globalDst, localDst, globalColour, localColour, shape.operation, shape.blendStrength);
+        globalColour = globalCombined.xyz;
+        globalDst = globalCombined.w;
+    }
+    return float4(globalColour, globalDst);
+}
+
+float GetShapeDisance(Shape shape, float3 eye)
+{
+    if (shape.shapeType == 0) 
+    {
+        return Sphere_SDF(eye, shape.position, shape.size.x);
+    }
+    else if (shape.shapeType == 1) 
+    {
+        return Cube_SDF(eye, shape.position, shape.size);
+    }
+    else if (shape.shapeType == 2) 
+    {
+        return Torus_SDF(eye, shape.position, shape.size.x, shape.size.y);
+    }
+    //return maxDst if shapeType isn't supported
+    return maxDst;
+}
+
+float Sphere_SDF(float3 eye, float3 centre, float radius)
+{
+    return distance(eye, centre) - radius;
+}
+float Cube_SDF(float3 eye, float3 centre, float3 size)
+{
+    float3 o = abs(eye - centre) - size;
+    float ud = length(max(o, 0));
+    float n = max(max(min(o.x, 0), min(o.y, 0)), min(o.z, 0));
+    return ud + n;
+}
+float Torus_SDF(float3 eye, float3 centre, float r1, float r2)
+{
+    float2 q = float2(length((eye - centre).xz) - r1, eye.y - centre.y);
+    return length(q) - r2;
+}
+
+float4 Combine(float dstA, float dstB, float3 colourA, float3 colourB, int operation, float blendStrength)
+{
+    float dst = dstA;
+    float3 colour = colourA;
+
+    if (operation == 0) {
+        if (dstB < dstA) {
+            dst = dstB;
+            colour = colourB;
+        }
+    }
+    // Blend
+    else if (operation == 1) {
+        float4 blend = Blend(dstA, dstB, colourA, colourB, blendStrength);
+        dst = blend.w;
+        colour = blend.xyz;
+    }
+    // Cut
+    else if (operation == 2) {
+        // max(a,-b)
+        if (-dstB > dst) {
+            dst = -dstB;
+            colour = colourB;
+        }
+    }
+    // Mask
+    else if (operation == 3) {
+        // max(a,b)
+        if (dstB > dst) {
+            dst = dstB;
+            colour = colourB;
+        }
+    }
+    return float4(colour, dst);
+}
+
+// polynomial smooth min (k = 0.1);
+float4 Blend(float a, float b, float3 colA, float3 colB, float k)
+{
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    float blendDst = lerp(b, a, h) - k * h * (1.0 - h);
+    float3 blendCol = lerp(colB, colA, h);
+    return float4(blendCol, blendDst);
+}
